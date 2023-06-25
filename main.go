@@ -16,6 +16,7 @@ import (
 var hFlag = flag.Bool("h", false, "Display ELF header")
 var lFlag = flag.Bool("l", false, "Display the program header")
 var SFlag = flag.Bool("S", false, "Display the section header")
+var nFlag = flag.Bool("n", false, "Display the PT Notes")
 var strdumpFlag = flag.String("string-dump", "", "dump the strings of section")
 
 var (
@@ -77,6 +78,19 @@ type Shdr64 struct {
 	sh_name_str  string
 } //total 64 bytes
 
+type ptNote64 struct {
+	n_namesz uint32 /* Name size, align to 4 */
+	n_descsz uint32 /* Content size, align to 4 */
+	n_type   uint32 /* Content type */
+}
+
+type ELFNT_NOTE struct {
+	owner      string
+	data       []byte
+	ntType     uint32
+	ntTypeName string
+}
+
 func main() {
 	flag.Parse()
 
@@ -109,6 +123,11 @@ func main() {
 
 	if *SFlag {
 		printSectionHeader(filename, elfHeader64)
+	}
+
+	if *nFlag {
+		notes := getPTNotes(filename, elfHeader64)
+		printNTNotes(notes)
 	}
 
 	if *strdumpFlag != "" {
@@ -307,7 +326,7 @@ func getSectionsHeader(fileName string, elfheader ELFHeader64) []Shdr64 {
 			_, err = io.ReadFull(bufr, b)
 			shdr := bytesToShdr(b)
 			headers = append(headers, shdr)
-			if shdr.sh_type == 3 && i == elfheader.e_shnum-1 {
+			if shdr.sh_type == 3 && i == elfheader.e_shstrndx {
 				shstrtab = shdr
 			}
 		}
@@ -358,6 +377,300 @@ func getSectionString(fileName string, shdr Shdr64) ([]string, map[int]string) {
 		return strs, GetStringLenMap(strs)
 	}
 	return nil, nil
+}
+
+func getPTNotes(fileName string, elfheader ELFHeader64) []ELFNT_NOTE {
+
+	var phdr Phdr64
+	phdrs := getPhdrs(fileName, elfheader)
+	for _, ph := range phdrs {
+		if ph.p_type == 4 { //type is PT_NOTE
+			phdr = ph
+		}
+	}
+
+	var elfNotes []ELFNT_NOTE
+
+	f, _ := os.Open(fileName)
+	_, err := f.Seek(int64(phdr.p_offset), 0)
+	if err != nil {
+		log.Fatal(err)
+	} else {
+		var count, readedBytes uint64
+		bufr := bufio.NewReader(f)
+		for count = 0; count < phdr.p_filesz; count = count + readedBytes {
+			// fmt.Printf("count is %d, phdr.p_filesz is %d\n", count, phdr.p_filesz)
+
+			readedBytes = 0
+			b := make([]byte, 12)
+			_, err = io.ReadFull(bufr, b)
+			readedBytes = readedBytes + 12
+
+			//read first 12 bytes
+			var ptNote ptNote64
+			ptNote.n_namesz = UINT32aglinTo(GetUINT32(b[0:4], LittleEndian), 4)
+			ptNote.n_descsz = UINT32aglinTo(GetUINT32(b[4:8], LittleEndian), 4)
+			ptNote.n_type = GetUINT32(b[8:12], LittleEndian)
+
+			readedBytes = readedBytes + uint64(ptNote.n_namesz) + uint64(ptNote.n_descsz)
+
+			var ntNote ELFNT_NOTE
+			//read owner name
+			b = make([]byte, ptNote.n_namesz)
+			_, err = io.ReadFull(bufr, b)
+
+			ntNote.owner = string(b)
+
+			//read data
+			b = make([]byte, ptNote.n_descsz)
+			_, err = io.ReadFull(bufr, b)
+
+			ntNote.data = b
+
+			ntNote.ntType = ptNote.n_type
+
+			elfNotes = append(elfNotes, ntNote)
+		}
+	}
+
+	return elfNotes
+}
+
+func printNTNotes(notes []ELFNT_NOTE) {
+	fmt.Printf("Owner                Data size 	Description\n")
+	for _, note := range notes {
+		fmt.Printf("%s           0x%08x     0x%x\n", note.owner, len(note.data), note.ntType)
+		if note.ntType == 1 { //NT_PRSTATUS
+			status := getPrStatus(note)
+			fmt.Printf("  info.signo:%d\n", status.pr_info.signo)
+			fmt.Printf("  info.errno:%d\n", status.pr_info.errno)
+			fmt.Printf("  info.code:%d\n", status.pr_info.code)
+			fmt.Printf("  pid:%d\n", status.pr_pid)
+			fmt.Printf("  ppid:%d\n", status.pr_ppid)
+
+			for i, reg := range status.pr_reg {
+				fmt.Printf("    reg%d: 0x%x\n", i, reg)
+			}
+		} else if note.ntType == 3 { //NT_PRPSINFO
+			info := getPrpsinfo(note)
+			fmt.Printf("  fname:%s\n", string(info.pr_fname[:]))
+			fmt.Printf("  pid:%d\n", info.pr_pid)
+			fmt.Printf("  ppid:%d\n", info.pr_ppid)
+		} else if note.ntType == 0x46494c45 { //NT_FILE
+			//NT_FILE
+			fileNote := getNTFILENote(note)
+			fmt.Printf("  Page size: %d\n", fileNote.pageSize)
+			fmt.Printf("  Start                 End         Page Offset\n")
+
+			var i int
+			for i = 0; i < int(fileNote.count); i++ {
+				fmt.Printf("  0x%016x  0x%016x  0x%016x\n", fileNote.elements[i].start, fileNote.elements[i].end, fileNote.elements[i].file_ofs)
+				fmt.Printf("      %s\n", fileNote.fileNames[i])
+			}
+		} else if note.ntType == 0xff000000 { //NT_GDB_TDESC
+			strs := GetStrings(note.data)
+			for _, str := range strs {
+				fmt.Printf("    %s\n", str)
+			}
+		} else if note.ntType == 0x000000ff { //CoreDumpInfo from vxworks
+			strs := GetStrings(note.data)
+			for i, str := range strs {
+				fmt.Printf("line %d\n", i)
+				fmt.Printf("    %s\n", str)
+			}
+		}
+	}
+}
+
+// #define MAX_FILE_NOTE_SIZE (4*1024*1024)
+// Format of NT_FILE note:
+// long count     -- how many files are mapped
+// long page_size -- units for file_ofs
+// array of [COUNT] elements of
+//   long start
+//   long end
+//   long file_ofs
+// followed by COUNT filenames in ASCII: "FILE1" NUL "FILE2" NUL...
+
+type ntEle struct {
+	start    uint64
+	end      uint64
+	file_ofs uint64
+}
+type ntFile struct {
+	count     uint64
+	pageSize  uint64
+	elements  []ntEle
+	fileNames []string
+}
+
+func getNTFILENote(note ELFNT_NOTE) ntFile {
+	var fileNote ntFile
+
+	fileNote.count = GetUINT64(note.data[0:8], LittleEndian)
+	fileNote.pageSize = GetUINT64(note.data[8:16], LittleEndian)
+
+	var i, base uint64
+	base = 16
+	for i = 0; i < fileNote.count; i++ {
+		var ele ntEle
+		start := i*24 + base
+		ele.start = GetUINT64(note.data[start:start+8], LittleEndian)
+		ele.end = GetUINT64(note.data[start+8:start+16], LittleEndian)
+		ele.file_ofs = GetUINT64(note.data[start+16:start+24], LittleEndian)
+
+		fileNote.elements = append(fileNote.elements, ele)
+	}
+
+	fileNote.fileNames = GetStrings(note.data[(16 + fileNote.count*24):])
+
+	return fileNote
+}
+
+// #define NT_PRSTATUS	1
+// #define NT_PRFPREG	2
+// #define NT_PRPSINFO	3
+// #define NT_TASKSTRUCT	4
+// #define NT_AUXV		6
+// /*
+//  * Note to userspace developers: size of NT_SIGINFO note may increase
+//  * in the future to accomodate more fields, don't assume it is fixed!
+//  */
+// #define NT_SIGINFO      0x53494749
+// #define NT_FILE         0x46494c45
+// #define NT_PRXFPREG     0x46e62b7f      /* copied from gdb5.1/include/elf/common.h */
+// #define NT_X86_XSTATE	0x202		/* x86 extended state using xsave */
+// #define NT_GDB_TDESC    0xff000000  /* Contains copy of GDB's target description XML.  */
+
+// #define ?    0x000000ff  /* unknown type from vxworks?  */
+
+type sigInfo struct {
+	signo uint32
+	code  uint32
+	errno uint32
+}
+
+type timeVal struct {
+	tv_sec  uint32
+	tv_usec uint32
+}
+
+type ntPrstatus struct {
+	pr_info    sigInfo  //12
+	pr_cursig  uint32   //4
+	pr_sigpend uint64   //8
+	pr_sighold uint64   //8
+	pr_pid     uint32   //8
+	pr_ppid    uint32   //8
+	pr_pgrp    uint32   //8
+	pr_sid     uint32   //8
+	pr_utime   timeVal  //16
+	pr_stime   timeVal  //16
+	pr_cutime  timeVal  //16
+	pr_cstime  timeVal  //16
+	pr_reg     []uint64 //8*reg
+	pr_fpvalid uint32   //4
+}
+
+func getPrStatus(note ELFNT_NOTE) ntPrstatus {
+	var status ntPrstatus
+
+	status.pr_info.signo = GetUINT32(note.data[0:4], LittleEndian)
+	status.pr_info.code = GetUINT32(note.data[4:8], LittleEndian)
+	status.pr_info.errno = GetUINT32(note.data[8:12], LittleEndian)
+
+	status.pr_cursig = GetUINT32(note.data[12:16], LittleEndian)
+	status.pr_sigpend = GetUINT64(note.data[16:24], LittleEndian)
+	status.pr_sighold = GetUINT64(note.data[24:32], LittleEndian)
+
+	status.pr_pid = GetUINT32(note.data[32:36], LittleEndian)
+	status.pr_ppid = GetUINT32(note.data[36:40], LittleEndian)
+	status.pr_pgrp = GetUINT32(note.data[40:44], LittleEndian)
+	status.pr_sid = GetUINT32(note.data[44:48], LittleEndian)
+
+	status.pr_utime.tv_sec = GetUINT32(note.data[48:52], LittleEndian)
+	status.pr_utime.tv_usec = GetUINT32(note.data[52:56], LittleEndian)
+
+	status.pr_stime.tv_sec = GetUINT32(note.data[56:60], LittleEndian)
+	status.pr_stime.tv_usec = GetUINT32(note.data[60:64], LittleEndian)
+
+	status.pr_cutime.tv_sec = GetUINT32(note.data[64:68], LittleEndian)
+	status.pr_cutime.tv_usec = GetUINT32(note.data[68:72], LittleEndian)
+
+	status.pr_cstime.tv_sec = GetUINT32(note.data[72:76], LittleEndian)
+	status.pr_cstime.tv_usec = GetUINT32(note.data[76:80], LittleEndian)
+
+	len := len(note.data)
+	var i int
+	for i = 0; i < (len-84)/8; i++ {
+		status.pr_reg = append(status.pr_reg, GetUINT64(note.data[80+i*8:88+i*8], LittleEndian))
+	}
+
+	status.pr_fpvalid = GetUINT32(note.data[:4], LittleEndian)
+
+	return status
+}
+
+// #define ELF_PRARGSZ	(80)	/* Number of chars for args */
+
+// struct elf_prpsinfo
+// {
+// 	char	pr_state;	/* numeric process state */
+// 	char	pr_sname;	/* char for pr_state */
+// 	char	pr_zomb;	/* zombie */
+// 	char	pr_nice;	/* nice val */
+// 	unsigned long pr_flag;	/* flags */
+// 	__kernel_uid_t	pr_uid;
+// 	__kernel_gid_t	pr_gid;
+// 	pid_t	pr_pid, pr_ppid, pr_pgrp, pr_sid;
+// 	/* Lots missing */
+// 	/*
+// 	 * The hard-coded 16 is derived from TASK_COMM_LEN, but it can't be
+// 	 * changed as it is exposed to userspace. We'd better make it hard-coded
+// 	 * here.
+// 	 */
+// 	char	pr_fname[16];	/* filename of executable */
+// 	char	pr_psargs[ELF_PRARGSZ];	/* initial part of arg list */
+// };
+
+type ntPrpsinfo struct {
+	pr_state byte
+	pr_sname byte
+	pr_zomb  byte
+	pr_nice  byte
+	pr_flag  uint64
+	pr_uid   uint32
+	pr_gid   uint32
+	pr_pid   uint32
+	pr_ppid  uint32
+	pr_pgrp  uint32
+	pr_sid   uint32
+
+	pr_fname  []byte
+	pr_psargs []byte
+}
+
+func getPrpsinfo(note ELFNT_NOTE) ntPrpsinfo {
+	var info ntPrpsinfo
+
+	info.pr_state = note.data[0]
+	info.pr_sname = note.data[1]
+	info.pr_zomb = note.data[2]
+	info.pr_nice = note.data[3]
+
+	info.pr_flag = GetUINT64(note.data[4:12], LittleEndian)
+
+	info.pr_uid = GetUINT32(note.data[12:16], LittleEndian)
+	info.pr_gid = GetUINT32(note.data[16:20], LittleEndian)
+	info.pr_pid = GetUINT32(note.data[20:24], LittleEndian)
+	info.pr_ppid = GetUINT32(note.data[24:28], LittleEndian)
+	info.pr_pgrp = GetUINT32(note.data[28:32], LittleEndian)
+	info.pr_sid = GetUINT32(note.data[32:36], LittleEndian)
+
+	info.pr_fname = note.data[36:52] // as [16]byte
+	info.pr_psargs = note.data[52:]
+
+	return info
 }
 
 func GetUINT64(buf []byte, asc bool) uint64 {
